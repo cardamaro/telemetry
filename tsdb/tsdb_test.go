@@ -12,27 +12,29 @@ func TestQuery(t *testing.T) {
 	db.Record("foo.bar", map[string]string{"a": "b"}, time.Now(), 2.0)
 	db.Record("foo.bar", map[string]string{"a": "b"}, time.Now(), 3.0)
 	db.Record("foo.bar", map[string]string{"a": "b", "c": "d"}, time.Now(), 4.0)
-	r := db.Query("foo.bar", map[string]string{"c": "d"})
+	r := db.Query("foo.bar", map[string]string{"a": "b"})
 	for _, row := range r {
 		fmt.Println(row.Var)
 		for _, s := range row.Samples {
 			fmt.Println(s)
 		}
 	}
+	db.Stats()
 }
 
 func TestQueryLarge(t *testing.T) {
 	db := NewTsdb()
 	start := time.Now()
 	for i := 0; i < 100000; i++ {
-		nt := fmt.Sprintf("%d", i)
+		nt := fmt.Sprintf("%d", i%10)
 		db.Record("foo.bar", map[string]string{nt: nt + nt}, time.Now(), float64(i))
 	}
 	t.Logf("duration: %s", time.Since(start))
+	db.Stats()
+
 	start = time.Now()
-	r := db.Query("foo.bar", map[string]string{"99": "9999"})
+	db.Query("foo.bar", map[string]string{"9": "99"})
 	t.Logf("duration: %s", time.Since(start))
-	t.Logf("result: %+v", r[0])
 }
 
 func BenchmarkRecord(b *testing.B) {

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"github.com/couchbaselabs/go-slab"
+	"math"
 	"sort"
 	"time"
 
@@ -33,14 +35,22 @@ type tsdb struct {
 	s          map[string]uint32
 	ss         map[uint32]string
 	metrics    map[uint32][][]byte
+	tagsets    map[uint32][]byte
+	stagsets   map[string]uint32
+	arena      *slab.Arena
 	tagCounter *telemetry.AtomicUint32
 }
 
 func NewTsdb() *tsdb {
+	arena := slab.NewArena(24, 1024*1024, 2, nil)
+
 	t := &tsdb{
 		s:          make(map[string]uint32),
 		ss:         make(map[uint32]string),
 		metrics:    make(map[uint32][][]byte),
+		tagsets:    make(map[uint32][]byte),
+		stagsets:   make(map[string]uint32),
+		arena:      arena,
 		tagCounter: new(telemetry.AtomicUint32),
 	}
 	t.tagCounter.Add(10000000)
@@ -69,23 +79,35 @@ func sortAndFilterTags(tags map[string]string) []string {
 	return keys
 }
 
+func (t *tsdb) Stats() {
+	m := make(map[string]int64)
+	t.arena.Stats(m)
+	var used int64
+	sc := m["numSlabClasses"]
+	for i := int64(0); i < sc; i++ {
+		prefix := fmt.Sprintf("slabClass-%06d-", i)
+		fmt.Println(prefix)
+		used += m[prefix+"chunkSize"] * m[prefix+"numChunksInUse"]
+	}
+	fmt.Printf("Total size: %d\n", used/(1024*1024))
+	fmt.Printf("Stats: %+v\n", m)
+}
+
 func (t *tsdb) Record(metric string, tags map[string]string, timestamp time.Time, value float64) {
 	keys := sortAndFilterTags(tags)
-	b := make([]byte, 8+(8*len(keys)), 16+(8*len(keys)))
+	b := t.arena.Alloc(16 + (8 * len(keys)))
 
 	binary.BigEndian.PutUint64(b, uint64(timestamp.UnixNano()))
+	binary.BigEndian.PutUint64(b[8:], math.Float64bits(value))
 
 	for i, k := range keys {
-		binary.BigEndian.PutUint32(b[8+(i*8):], t.getIdForString(k))
-		binary.BigEndian.PutUint32(b[12+(i*8):], t.getIdForString(tags[k]))
+		binary.BigEndian.PutUint32(b[16+(i*8):], t.getIdForString(k))
+		binary.BigEndian.PutUint32(b[20+(i*8):], t.getIdForString(tags[k]))
 	}
 
-	buf := bytes.NewBuffer(b)
-	binary.Write(buf, binary.BigEndian, value)
-
 	metricId := t.getIdForString(metric)
-	t.metrics[metricId] = append(t.metrics[metricId], buf.Bytes())
-	//fmt.Printf("recorded metric %s [%d] @ %s:\n% x\n", metric, t.getIdForString(metric), timestamp, buf.Bytes())
+	t.metrics[metricId] = append(t.metrics[metricId], b)
+	//fmt.Printf("recorded metric %s [%d] @ %s:\n% x\n", metric, t.getIdForString(metric), timestamp, b)
 }
 
 func (t *tsdb) Query(metric string, tags map[string]string) []*Row {
@@ -96,7 +118,7 @@ func (t *tsdb) Query(metric string, tags map[string]string) []*Row {
 
 	keys := sortAndFilterTags(tags)
 
-	filter := make([]byte, 8*len(keys))
+	filter := t.arena.Alloc(8 * len(keys))
 	for _, k := range keys {
 		binary.BigEndian.PutUint32(filter, t.getIdForString(k))
 		binary.BigEndian.PutUint32(filter[4:], t.getIdForString(tags[k]))
@@ -106,13 +128,13 @@ func (t *tsdb) Query(metric string, tags map[string]string) []*Row {
 	out := make(map[string]*Row)
 
 	for _, b := range entry {
-		l := len(b)
-		tagBytes := b[8 : l-8]
 		var value float64
 		include := true
 
 		timestamp := time.Unix(0, int64(binary.BigEndian.Uint64(b[0:8])))
-		for off := 0; off < len(filter); off += 8 {
+		tagBytes := b[16:]
+
+		for off := 0; off < 8*len(keys); off += 8 {
 			filterBytes := filter[off : off+8]
 			idx := bytes.Index(tagBytes, filterBytes)
 			if idx == -1 || idx%8 != 0 {
@@ -123,18 +145,18 @@ func (t *tsdb) Query(metric string, tags map[string]string) []*Row {
 		}
 
 		if include {
-			binary.Read(bytes.NewReader(b[l-8:]), binary.BigEndian, &value)
+			value = math.Float64frombits((binary.BigEndian.Uint64(b[8:16])))
 			row, ok := out[string(tagBytes)]
 			if !ok {
 				v := metric
-				for off := 8; off < l-8; off += 8 {
-					if off == 8 {
+				for off := 0; off < len(tagBytes); off += 8 {
+					if off == 0 {
 						v += "{"
 					}
-					tag := t.ss[binary.BigEndian.Uint32(b[off:off+4])]
-					val := t.ss[binary.BigEndian.Uint32(b[off+4:off+8])]
+					tag := t.ss[binary.BigEndian.Uint32(tagBytes[off:off+4])]
+					val := t.ss[binary.BigEndian.Uint32(tagBytes[off+4:off+8])]
 					v += tag + "=" + val
-					if off+8 == l-8 {
+					if off+8 == len(tagBytes) {
 						v += "}"
 					} else {
 						v += ","
@@ -147,6 +169,8 @@ func (t *tsdb) Query(metric string, tags map[string]string) []*Row {
 			row.Samples = append(row.Samples, &Sample{timestamp, value})
 		}
 	}
+
+	t.arena.DecRef(filter)
 
 	return rows
 }
