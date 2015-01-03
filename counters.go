@@ -33,9 +33,9 @@ func (c *Counters) String() string {
 	return counterToString(c.counts)
 }
 
-func (c *Counters) Merge(other expvar.Var) {
+func (c *Counters) Merge(other expvar.Var) error {
 	if _, ok := other.(*Counters); !ok {
-		return
+		return fmt.Errorf("incompatible type: %t", other)
 	}
 
 	c.mu.Lock()
@@ -44,6 +44,8 @@ func (c *Counters) Merge(other expvar.Var) {
 	for k, v := range other.(*Counters).counts {
 		c.counts[k] += v
 	}
+
+	return nil
 }
 
 func (c *Counters) Add(name string, value int64) {

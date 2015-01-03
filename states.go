@@ -50,9 +50,9 @@ func (s *States) SetState(state int64) {
 	s.setStateAt(state, time.Now())
 }
 
-func (s *States) Merge(other expvar.Var) {
+func (s *States) Merge(other expvar.Var) error {
 	if _, ok := other.(*States); !ok {
-		return
+		return fmt.Errorf("incompatible type: %t", other)
 	}
 
 	s.mu.Lock()
@@ -64,6 +64,8 @@ func (s *States) Merge(other expvar.Var) {
 	for k, v := range other.(*States).transitions {
 		s.transitions[k] += v
 	}
+
+	return nil
 }
 
 // now has to be increasing, or we panic. Usually, only one execution

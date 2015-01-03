@@ -9,7 +9,7 @@ import (
 
 type MergeVar interface {
 	expvar.Var
-	Merge(other expvar.Var)
+	Merge(other expvar.Var) error
 }
 
 type NewRollupMapEntryFunc func() map[string]MergeVar

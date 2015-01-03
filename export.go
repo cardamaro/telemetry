@@ -16,6 +16,7 @@
 package telemetry
 
 import (
+	"errors"
 	"expvar"
 	"strconv"
 	"sync"
@@ -124,7 +125,9 @@ type Int struct {
 
 func NewInt(name string) *Int {
 	v := new(Int)
-	Publish(name, v)
+	if name != "" {
+		Publish(name, v)
+	}
 	return v
 }
 
@@ -144,6 +147,14 @@ func (v *Int) String() string {
 	return strconv.FormatInt(v.i.Get(), 10)
 }
 
+func (v *Int) Merge(other expvar.Var) error {
+	if _, ok := other.(*Int); !ok {
+		return errors.New("incompatible type")
+	}
+	v.Add(other.(*Int).Get())
+	return nil
+}
+
 // Duration exports a time.Duration
 type Duration struct {
 	i AtomicDuration
@@ -151,7 +162,9 @@ type Duration struct {
 
 func NewDuration(name string) *Duration {
 	v := new(Duration)
-	Publish(name, v)
+	if name != "" {
+		Publish(name, v)
+	}
 	return v
 }
 
@@ -169,6 +182,14 @@ func (v *Duration) Get() time.Duration {
 
 func (v *Duration) String() string {
 	return strconv.FormatInt(int64(v.i.Get()), 10)
+}
+
+func (v *Duration) Merge(other expvar.Var) error {
+	if _, ok := other.(*Duration); !ok {
+		return errors.New("incompatible type")
+	}
+	v.Add(other.(*Duration).Get())
+	return nil
 }
 
 // IntFunc converts a function that returns
