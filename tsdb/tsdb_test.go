@@ -7,32 +7,45 @@ import (
 	"time"
 )
 
-func TestQuery(t *testing.T) {
+func TestFetch(t *testing.T) {
 	db := NewTsdb()
 	db.Record("foo.bar", map[string]string{"a": "b"}, time.Now(), 1.0)
 	db.Record("foo.bar", map[string]string{"a": "b"}, time.Now(), 2.0)
 	db.Record("foo.bar", map[string]string{"a": "c", "c": "d", "X": "Z"}, time.Now(), 3.0)
 	db.Record("foo.bar", map[string]string{"a": "c", "c": "e"}, time.Now(), 4.0)
-	r := db.Query("foo.bar", map[string]string{"a": "b"})
+	r := db.Fetch("foo.bar", nil)
 	for _, row := range r {
-		fmt.Println(row.Var())
-		for _, s := range row.Samples() {
+		fmt.Println(row.Var)
+		for _, s := range row.Samples {
 			fmt.Println(s)
 		}
 	}
 
+	fmt.Println("== Sum")
+	r = db.Do(Sum, "foo.bar", nil, nil)
+	fmt.Println(r)
+	fmt.Println("== Count")
+	r = db.Do(Count, "foo.bar", nil, nil)
+	fmt.Println(r)
+
 	fmt.Println("== Sum w/ Filter {a=b}")
-	r = db.Sum("foo.bar", map[string]string{"a": "b"}, nil)
+	r = db.Do(Sum, "foo.bar", map[string]string{"a": "b"}, nil)
 	fmt.Println(r)
 
 	fmt.Println("== Sum w/ Group By [a, c]")
-	r = db.Sum("foo.bar", nil, []string{"a", "c"})
+	r = db.Do(Sum, "foo.bar", nil, []string{"a", "c"})
 	fmt.Println(r)
-	r = db.Sum("foo.bar", map[string]string{"c": "d"}, []string{"a", "c"})
+
+	fmt.Println("== Count w/ Group By [a, c]")
+	r = db.Do(Count, "foo.bar", nil, []string{"a", "c"})
+	fmt.Println(r)
+
+	fmt.Println("== Sum w/ Filter {c=d} and Group By [a, c]")
+	r = db.Do(Sum, "foo.bar", map[string]string{"c": "d"}, []string{"a", "c"})
 	fmt.Println(r)
 }
 
-func TestQueryLarge(t *testing.T) {
+func TestFetchLarge(t *testing.T) {
 	db := NewTsdb()
 	start := time.Now()
 	var m1, m2 runtime.MemStats
@@ -50,7 +63,7 @@ func TestQueryLarge(t *testing.T) {
 	db.Stats()
 
 	start = time.Now()
-	db.Query("foo.bar", map[string]string{"9": "99"})
+	db.Fetch("foo.bar", map[string]string{"9": "99"})
 	t.Logf("duration: %s", time.Since(start))
 }
 
@@ -62,7 +75,7 @@ func BenchmarkRecord(b *testing.B) {
 	}
 }
 
-func benchmarkQuery(size int, b *testing.B) {
+func benchmarkFetch(size int, b *testing.B) {
 	db := NewTsdb()
 	for n := 0; n < size; n++ {
 		nt := fmt.Sprintf("%d", n)
@@ -71,10 +84,10 @@ func benchmarkQuery(size int, b *testing.B) {
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		nt := fmt.Sprintf("%d", n)
-		db.Query("foo.bar", map[string]string{nt: nt + nt})
+		db.Fetch("foo.bar", map[string]string{nt: nt + nt})
 	}
 }
 
-func BenchmarkQuery10(b *testing.B)   { benchmarkQuery(10, b) }
-func BenchmarkQuery100(b *testing.B)  { benchmarkQuery(100, b) }
-func BenchmarkQuery1000(b *testing.B) { benchmarkQuery(1000, b) }
+func BenchmarkFetch10(b *testing.B)   { benchmarkFetch(10, b) }
+func BenchmarkFetch100(b *testing.B)  { benchmarkFetch(100, b) }
+func BenchmarkFetch1000(b *testing.B) { benchmarkFetch(1000, b) }
