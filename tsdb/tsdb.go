@@ -1,5 +1,8 @@
 package tsdb
 
+// Package tsdb implements a simple, many-dimensional, in-memory timeseries
+// database with some basic query operations.
+
 import (
 	"bytes"
 	"encoding/binary"
