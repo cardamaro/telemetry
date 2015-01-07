@@ -17,6 +17,11 @@ import (
 	"github.com/cardamaro/telemetry"
 )
 
+const (
+	TsdbOverheadMetric        = "tsdb.arena.overhead"
+	TsdbArenaMallocSizeMetric = "tsdb.arena.malloc"
+)
+
 type TimeseriesDatabase interface {
 	Metrics() []string
 	Record(metric string, tags map[string]string, timestamp time.Time, value float64)
@@ -55,6 +60,7 @@ type Tsdb struct {
 	tagsets    map[uint32][]byte
 	stagsets   map[string]uint32
 	arena      *slab.Arena
+	allocsChan chan int
 	tagCounter *telemetry.AtomicUint32
 }
 
@@ -65,20 +71,28 @@ const (
 
 // NewTsdb returns a new timeseries database.
 func NewTsdb() *Tsdb {
-	// 1mb slab size, with doubling
-	arena := slab.NewArena(sampleWidth, 1024*1024, 2, nil)
-
 	t := &Tsdb{
 		s:          make(map[string]uint32),
 		ss:         make(map[uint32]string),
 		metrics:    make(map[string][][]byte),
 		tagsets:    make(map[uint32][]byte),
 		stagsets:   make(map[string]uint32),
-		arena:      arena,
+		allocsChan: make(chan int, 64),
 		tagCounter: new(telemetry.AtomicUint32),
 	}
 
+	// 1mb slab size, with doubling
+	t.arena = slab.NewArena(sampleWidth, 1024*1024, 2, t.malloc)
+
 	return t
+}
+
+func (t *Tsdb) malloc(size int) []byte {
+	select {
+	case t.allocsChan <- size:
+	default:
+	}
+	return make([]byte, size)
 }
 
 // Metrics returns a string slice containing the names of all metrics currently
@@ -116,7 +130,16 @@ func (t *Tsdb) Stats() {
 func (t *Tsdb) Record(metric string, tags map[string]string, timestamp time.Time, value float64) {
 	t.Lock()
 	defer t.Unlock()
+
 	t.internalRecord(metric, t.getIdForTags(tags), timestamp, value)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case size := <-t.allocsChan:
+			t.internalRecord(TsdbArenaMallocSizeMetric, 0, time.Now(), float64(size))
+		default:
+		}
+	}
 }
 
 func (t *Tsdb) internalRecord(metric string, tagsId uint32, timestamp time.Time, value float64) {
@@ -283,6 +306,14 @@ func (t *Tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
 	return rows
 }
 
+// Yields the value associated with the string, or the sentinel value.
+func (t *Tsdb) getIdForString(s string) uint32 {
+	if v, ok := t.s[s]; ok {
+		return v
+	}
+	return maxStringId
+}
+
 // Interns the string and then returns or generates and returns a unique
 // value associated with it.
 func (t *Tsdb) getOrAddIdForString(s string) uint32 {
@@ -293,17 +324,10 @@ func (t *Tsdb) getOrAddIdForString(s string) uint32 {
 	if v == maxStringId {
 		panic("maxStringId reached")
 	}
+	t.internalRecord(TsdbOverheadMetric, 0, time.Now(), float64(len(s)+4))
 	t.s[s] = v
 	t.ss[v] = s
 	return v
-}
-
-// Yields the value associated with the string, or the sentinel value.
-func (t *Tsdb) getIdForString(s string) uint32 {
-	if v, ok := t.s[s]; ok {
-		return v
-	}
-	return maxStringId
 }
 
 // Canonicalizes the tags into a discrete value.
@@ -321,6 +345,7 @@ func (t *Tsdb) getIdForTags(tags map[string]string) uint32 {
 	if v == maxStringId {
 		panic("maxStringId reached")
 	}
+	t.internalRecord(TsdbOverheadMetric, 0, time.Now(), float64(len(tbuf)+4))
 	t.tagsets[v] = tbuf
 	t.stagsets[string(tbuf)] = v
 	return v
