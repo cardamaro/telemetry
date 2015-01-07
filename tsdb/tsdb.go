@@ -17,6 +17,13 @@ import (
 	"github.com/cardamaro/telemetry"
 )
 
+type TimeseriesDatabase interface {
+	Metrics() []string
+	Record(metric string, tags map[string]string, timestamp time.Time, value float64)
+	Fetch(metric string, tags map[string]string) []*Row
+	Do(op Op, metric string, filterTags map[string]string, groupBy []string) []*Row
+}
+
 // Row defines a single var and the associated samples. If the Row is
 // returned as the result of an operation, Max and Min will be defined.
 type Row struct {
@@ -40,33 +47,28 @@ func (s *Sample) String() string {
 	return fmt.Sprintf("<%.3f @ %s>", s.Value, s.Timestamp)
 }
 
-type TimeseriesDatabase interface {
-	Metrics() []string
-	Record(metric string, tags map[string]string, timestamp time.Time, value float64)
-	Fetch(metric string, tags map[string]string) []*Row
-	Do(op Op, metric string, filterTags map[string]string, groupBy []string) []*Row
-}
-
-type tsdb struct {
+type Tsdb struct {
+	sync.RWMutex
 	s          map[string]uint32
 	ss         map[uint32]string
 	metrics    map[string][][]byte
 	tagsets    map[uint32][]byte
 	stagsets   map[string]uint32
 	arena      *slab.Arena
-	mu         *sync.RWMutex
 	tagCounter *telemetry.AtomicUint32
 }
 
-const maxStringId uint32 = 1<<32 - 1
+const (
+	maxStringId uint32 = 1<<32 - 1
+	sampleWidth        = 16
+)
 
 // NewTsdb returns a new timeseries database.
-func NewTsdb() *tsdb {
-	// 64 byte chunk size represents 4 samples worth of data.
+func NewTsdb() *Tsdb {
 	// 1mb slab size, with doubling
-	arena := slab.NewArena(64, 1024*1024, 2, nil)
+	arena := slab.NewArena(sampleWidth, 1024*1024, 2, nil)
 
-	t := &tsdb{
+	t := &Tsdb{
 		s:          make(map[string]uint32),
 		ss:         make(map[uint32]string),
 		metrics:    make(map[string][][]byte),
@@ -74,7 +76,6 @@ func NewTsdb() *tsdb {
 		stagsets:   make(map[string]uint32),
 		arena:      arena,
 		tagCounter: new(telemetry.AtomicUint32),
-		mu:         new(sync.RWMutex),
 	}
 
 	return t
@@ -82,7 +83,9 @@ func NewTsdb() *tsdb {
 
 // Metrics returns a string slice containing the names of all metrics currently
 // tracked in the database. The slice will be sorted.
-func (t *tsdb) Metrics() []string {
+func (t *Tsdb) Metrics() []string {
+	t.RLock()
+	defer t.RUnlock()
 	out := make([]string, 0, len(t.metrics))
 	for m, _ := range t.metrics {
 		out = append(out, m)
@@ -92,7 +95,7 @@ func (t *tsdb) Metrics() []string {
 }
 
 // Stats currently prints some arbitrary and nearly useless information.
-func (t *tsdb) Stats() {
+func (t *Tsdb) Stats() {
 	m := make(map[string]int64)
 	t.arena.Stats(m)
 	var used int64
@@ -110,12 +113,16 @@ func (t *tsdb) Stats() {
 //
 // Example:
 //   t.Record("foo.bar.baz", map[string]string{"user": "bob", "ip": "10.0.1.2"}, time.Now(), 456.234)
-func (t *tsdb) Record(metric string, tags map[string]string, timestamp time.Time, value float64) {
-	b := t.arena.Alloc(4 + 4 + 8)
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *Tsdb) Record(metric string, tags map[string]string, timestamp time.Time, value float64) {
+	t.Lock()
+	defer t.Unlock()
+	t.internalRecord(metric, t.getIdForTags(tags), timestamp, value)
+}
+
+func (t *Tsdb) internalRecord(metric string, tagsId uint32, timestamp time.Time, value float64) {
+	b := t.arena.Alloc(sampleWidth)
 	binary.BigEndian.PutUint32(b, uint32(timestamp.Unix()))
-	binary.BigEndian.PutUint32(b[4:], t.getIdForTags(tags))
+	binary.BigEndian.PutUint32(b[4:], tagsId)
 	binary.BigEndian.PutUint64(b[8:], math.Float64bits(value))
 	t.metrics[metric] = append(t.metrics[metric], b)
 }
@@ -138,21 +145,21 @@ const (
 //   t.Record("foo.bar", map[string]string{"user": "bob", "ip": "10.0.1.2"}, time.Now(), 4)
 //   t.Record("foo.bar", map[string]string{"user": "sam", "ip": "10.0.1.2"}, time.Now(), 5)
 //   t.Record("foo.bar", map[string]string{"user": "sam", "ip": "10.0.1.2"}, time.Now(), 6)
-//   ...
+//
 //   rows := t.Do(Sum, "foo.bar", nil, []string{"user"})
 //   // returns:
 //   // foo.bar{user=bob} = 7.0
 //   // foo.bar{user=sam} = 11.0
-//   ...
+//
 //   rows := t.Do(Count, "foo.bar", nil, []string{"user"})
 //   // returns:
 //   // foo.bar{user=bob} = 2.0
 //   // foo.bar{user=sam} = 2.0
-//   ...
+//
 //   rows := t.Do(Count, "foo.bar", nil, []string{"ip"})
 //   // returns:
 //   // foo.bar{ip=10.0.1.2} = 4.0
-func (t *tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []string) []*Row {
+func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []string) []*Row {
 	var (
 		varname string
 		tags    []string
@@ -163,15 +170,16 @@ func (t *tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 		tags = append(tags, k+"="+v)
 	}
 
+	t.RLock()
+	defer t.RUnlock()
+
 	// build up the set of groupBy tags
 	hasGroupBy := len(groupBy) > 0
 	groupByIds := make(map[uint32]struct{})
 	if hasGroupBy {
-		t.mu.RLock()
 		for _, v := range groupBy {
 			groupByIds[t.getIdForString(v)] = struct{}{}
 		}
-		t.mu.RUnlock()
 	} else {
 		varname = metric + "{" + strings.Join(tags, ",") + "}"
 	}
@@ -241,9 +249,12 @@ func (t *tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 
 // Fetch returns all discrete varnames and all associated samples. If filterTags
 // is non-nil, rows will be filtered by all filter tag values (implicit AND).
-func (t *tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
+func (t *Tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
 	var rows []*Row
 	out := make(map[string]*Row)
+
+	t.RLock()
+	defer t.RUnlock()
 
 	t.op(metric, filterTags, func(tagBytes []byte, value float64, timestamp time.Time) {
 		r, ok := out[string(tagBytes)]
@@ -272,23 +283,9 @@ func (t *tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
 	return rows
 }
 
-// intern table for strings
-var intern = make(map[string]string)
-
-// thread unsafe
-func (t *tsdb) internString(s string) string {
-	if v, ok := intern[s]; ok {
-		return v
-	}
-	intern[s] = s
-	return s
-}
-
 // Interns the string and then returns or generates and returns a unique
 // value associated with it.
-// thread unsafe
-func (t *tsdb) getOrAddIdForString(s string) uint32 {
-	s = t.internString(s)
+func (t *Tsdb) getOrAddIdForString(s string) uint32 {
 	if v, ok := t.s[s]; ok {
 		return v
 	}
@@ -302,10 +299,7 @@ func (t *tsdb) getOrAddIdForString(s string) uint32 {
 }
 
 // Yields the value associated with the string, or the sentinel value.
-// thread safe
-func (t *tsdb) getIdForString(s string) uint32 {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
+func (t *Tsdb) getIdForString(s string) uint32 {
 	if v, ok := t.s[s]; ok {
 		return v
 	}
@@ -313,17 +307,14 @@ func (t *tsdb) getIdForString(s string) uint32 {
 }
 
 // Canonicalizes the tags into a discrete value.
-// thread unsafe
-func (t *tsdb) getIdForTags(tags map[string]string) uint32 {
+func (t *Tsdb) getIdForTags(tags map[string]string) uint32 {
 	keys := sortAndFilterTags(tags)
-	tbuf := t.arena.Alloc(8 * len(keys))
+	tbuf := make([]byte, 8*len(keys))
 	for i, k := range keys {
 		binary.BigEndian.PutUint32(tbuf[i*8:], t.getOrAddIdForString(k))
 		binary.BigEndian.PutUint32(tbuf[4+(i*8):], t.getOrAddIdForString(tags[k]))
 	}
-	strtbuf := t.internString(string(tbuf))
-	if v, ok := t.stagsets[strtbuf]; ok {
-		t.arena.DecRef(tbuf)
+	if v, ok := t.stagsets[string(tbuf)]; ok {
 		return v
 	}
 	v := t.tagCounter.Add(1)
@@ -331,7 +322,7 @@ func (t *tsdb) getIdForTags(tags map[string]string) uint32 {
 		panic("maxStringId reached")
 	}
 	t.tagsets[v] = tbuf
-	t.stagsets[strtbuf] = v
+	t.stagsets[string(tbuf)] = v
 	return v
 }
 
@@ -352,22 +343,15 @@ type rowProcessor func(tagBytes []byte, value float64, timestamp time.Time)
 
 // Iterate over metric values, calling rowProcessor. Skips rows that match tags in
 // filterTags.
-// thread safe
-func (t *tsdb) op(metric string, filterTags map[string]string, proc rowProcessor) {
-	t.mu.RLock()
+func (t *Tsdb) op(metric string, filterTags map[string]string, proc rowProcessor) {
 	entry, ok := t.metrics[metric]
-	t.mu.RUnlock()
 	if !ok {
 		return
 	}
 
 	keys := sortAndFilterTags(filterTags)
 	lenKeys := len(keys)
-
 	filter := make([]byte, 8*len(keys))
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
 
 	for _, k := range keys {
 		binary.BigEndian.PutUint32(filter, t.getIdForString(k))
