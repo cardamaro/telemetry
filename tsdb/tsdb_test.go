@@ -2,6 +2,7 @@ package tsdb
 
 import (
 	"fmt"
+	"math/rand"
 	"runtime"
 	"testing"
 	"time"
@@ -35,7 +36,6 @@ func TestMem(t *testing.T) {
 		//foo1.x[fmt.Sprintf("%d", i)] = "bar" + fmt.Sprintf("%d", i % 10)
 		db1.Record(fmt.Sprintf("%d", i), map[string]string{"a": fmt.Sprintf("%d", i)}, time.Now(), 1)
 	}
-	time.Sleep(50 * time.Millisecond)
 	runtime.GC()
 	runtime.ReadMemStats(&m2)
 	t.Logf("Not interned:")
@@ -49,7 +49,6 @@ func TestMem(t *testing.T) {
 		//foo2.x[get(fmt.Sprintf("%d", i))] = get("bar" + fmt.Sprintf("%d", i % 10))
 		db2.Record(fmt.Sprintf("%d", i), map[string]string{"a": fmt.Sprintf("%d", i)}, time.Now(), 1)
 	}
-	time.Sleep(50 * time.Millisecond)
 	runtime.GC()
 	runtime.ReadMemStats(&m2)
 	t.Logf("Interned:")
@@ -67,7 +66,6 @@ func TestFetch(t *testing.T) {
 	db.Record("foo.bar", map[string]string{"a": "b"}, time.Now(), 2.0)
 	db.Record("foo.bar", map[string]string{"a": "c", "c": "d", "X": "Z"}, time.Now(), 3.0)
 	db.Record("foo.bar", map[string]string{"a": "c", "c": "e"}, time.Now(), 4.0)
-	time.Sleep(50 * time.Millisecond)
 	r := db.Fetch("foo.bar", nil)
 	for _, row := range r {
 		fmt.Println(row.Var)
@@ -100,6 +98,15 @@ func TestFetch(t *testing.T) {
 	fmt.Println(r)
 }
 
+func TestDoDistribution(t *testing.T) {
+	db := NewTsdb()
+	for i := 1; i <= 10000; i++ {
+		db.Record("foo.bar", nil, time.Now(), rand.Float64()*100)
+	}
+	r := db.Do(Distribution, "foo.bar", nil, nil)
+	fmt.Println(r[0].histogram.Counts())
+}
+
 func TestFetchLarge(t *testing.T) {
 	db := NewTsdb()
 	start := time.Now()
@@ -109,7 +116,6 @@ func TestFetchLarge(t *testing.T) {
 		nt := fmt.Sprintf("%d", i%100)
 		db.Record("foo.bar", map[string]string{"foo": nt}, time.Now(), float64(i))
 	}
-	time.Sleep(50 * time.Millisecond)
 	runtime.GC()
 	runtime.ReadMemStats(&m2)
 	t.Logf("HeapAlloc: %d", m2.HeapAlloc)
@@ -137,7 +143,6 @@ func benchmarkFetch(size int, b *testing.B) {
 		nt := fmt.Sprintf("%d", n)
 		db.Record("foo.bar", map[string]string{nt: nt + nt}, time.Now(), float64(n))
 	}
-	time.Sleep(50 * time.Millisecond)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		nt := fmt.Sprintf("%d", n)
@@ -155,7 +160,6 @@ func benchmarkDo(size int, groupBy bool, b *testing.B) {
 		nt := fmt.Sprintf("%d", n)
 		db.Record("foo.bar", map[string]string{nt: nt + nt}, time.Now(), float64(n))
 	}
-	time.Sleep(50 * time.Millisecond)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
 		nt := fmt.Sprintf("%d", n)

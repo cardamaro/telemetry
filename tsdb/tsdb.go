@@ -17,6 +17,21 @@ import (
 	"github.com/cardamaro/telemetry"
 )
 
+var (
+	percentiles  = []float64{0.5, 0.75, 0.9, 0.95, 0.99, 0.999}
+	bucketLabels []string
+)
+
+func init() {
+	for _, p := range percentiles {
+		bucketLabels = append(bucketLabels,
+			strings.Replace(
+				strings.TrimSuffix(fmt.Sprintf("p%.1f", p*100), ".0"),
+				".", "", -1))
+	}
+	bucketLabels = append(bucketLabels, "max")
+}
+
 const (
 	TsdbOverheadMetric        = "tsdb.arena.overhead"
 	TsdbArenaMallocSizeMetric = "tsdb.arena.malloc"
@@ -32,9 +47,17 @@ type TimeseriesDatabase interface {
 // Row defines a single var and the associated samples. If the Row is
 // returned as the result of an operation, Max and Min will be defined.
 type Row struct {
-	Var      string
-	Samples  []*Sample
-	Max, Min *Sample `json:",omitempty"`
+	Var       string
+	Samples   []*Sample
+	Max, Min  *Sample `json:",omitempty"`
+	histogram *telemetry.Histogram
+}
+
+func (r *Row) Histogram() map[string]int64 {
+	if r.histogram == nil {
+		return nil
+	}
+	return r.histogram.Counts()
 }
 
 func (r *Row) String() string {
@@ -156,6 +179,7 @@ type Op int
 const (
 	Sum Op = iota
 	Count
+	Distribution
 )
 
 // Do applies an operation Op to each matching measurement in the database and
@@ -251,6 +275,8 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 			out[varname].Samples[0].Value += value
 		case Count:
 			out[varname].Samples[0].Value += 1
+		case Distribution:
+			out[varname].Samples = append(out[varname].Samples, &Sample{now, value})
 		}
 
 		// keep a few extra stats
@@ -264,6 +290,21 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 
 	rows := make([]*Row, 0, len(out))
 	for _, v := range out {
+		if op == Distribution {
+			var bucketCutoffs []int64
+			max := v.Max.Value
+
+			for _, p := range percentiles {
+				bucketCutoffs = append(bucketCutoffs, int64((max*p)*1e9))
+			}
+
+			h := telemetry.NewGenericHistogram("", bucketCutoffs, bucketLabels, "Count", "Total")
+			for _, sample := range v.Samples {
+				h.Add(int64(sample.Value * 1e9))
+			}
+			v.Samples = nil
+			v.histogram = h
+		}
 		rows = append(rows, v)
 	}
 
