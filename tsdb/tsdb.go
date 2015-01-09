@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	percentiles  = []float64{0.5, 0.75, 0.9, 0.95, 0.99, 0.999}
+	percentiles  = []float64{0.05, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999}
 	bucketLabels []string
 )
 
@@ -177,7 +177,7 @@ func (t *Tsdb) internalRecord(metric string, tagsId uint32, timestamp time.Time,
 type Op int
 
 const (
-	Sum Op = iota
+	Sum Op = iota + 1
 	Count
 	Distribution
 )

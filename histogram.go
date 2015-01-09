@@ -94,6 +94,17 @@ func (h *Histogram) MarshalJSON() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+func (h *Histogram) Bins() map[string]int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	bins := make(map[string]int64, len(h.cutoffs))
+	for i, cut := range h.cutoffs {
+		bins[h.labels[i]] = cut
+	}
+	return bins
+}
+
 func (h *Histogram) Counts() map[string]int64 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
