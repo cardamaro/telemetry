@@ -7,36 +7,30 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"github.com/couchbaselabs/go-slab"
+	"hash/crc32"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cardamaro/telemetry"
+	"github.com/couchbaselabs/go-slab"
+)
+
+// Metric names for internal state tracking counters
+const (
+	TsdbOverheadMetric        = "tsdb.arena.overhead" // string overhead counter
+	TsdbArenaMallocSizeMetric = "tsdb.arena.malloc"   // malloc bytes counter
 )
 
 var (
-	percentiles  = []float64{0.05, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999}
-	bucketLabels []string
+	defaultPercentiles     = []float64{0.5, 0.75, 0.9, 0.95, 0.99, 0.999}
+	defaultPercentileNames = []string{"p50", "p75", "p90", "p95", "p99", "p999"}
 )
 
-func init() {
-	for _, p := range percentiles {
-		bucketLabels = append(bucketLabels,
-			strings.Replace(
-				strings.TrimSuffix(fmt.Sprintf("p%.1f", p*100), ".0"),
-				".", "", -1))
-	}
-	bucketLabels = append(bucketLabels, "max")
-}
-
-const (
-	TsdbOverheadMetric        = "tsdb.arena.overhead"
-	TsdbArenaMallocSizeMetric = "tsdb.arena.malloc"
-)
-
+// TimeseriesDatabase describes a simple timeseries database interface for
+// recording and querying accumulators.
 type TimeseriesDatabase interface {
 	Metrics() []string
 	Record(metric string, tags map[string]string, timestamp time.Time, value float64)
@@ -50,14 +44,25 @@ type Row struct {
 	Var       string
 	Samples   []*Sample
 	Max, Min  *Sample `json:",omitempty"`
-	histogram *telemetry.Histogram
+	histogram *floatSampledHistogram
 }
 
-func (r *Row) Histogram() map[string]int64 {
+// Histogram returns a JSON string representation of the distribution of values in the row.
+func (r *Row) Histogram() string {
 	if r.histogram == nil {
-		return nil
+		return ""
 	}
-	return r.histogram.Counts()
+	v := r.histogram.Distribution()
+	b := &bytes.Buffer{}
+	fmt.Fprintf(b, `{"count":%d,"sum":%f,"min":%f,"max":%f,"mean":%s`,
+		v.Count, v.Sum, v.Min, v.Max,
+		strconv.FormatFloat(v.Mean(), 'g', -1, 64))
+	perc := r.histogram.Percentiles(defaultPercentiles)
+	for i, p := range perc {
+		fmt.Fprintf(b, `,"%s":%f`, defaultPercentileNames[i], p)
+	}
+	fmt.Fprintf(b, "}")
+	return b.String()
 }
 
 func (r *Row) String() string {
@@ -75,37 +80,33 @@ func (s *Sample) String() string {
 	return fmt.Sprintf("<%.3f @ %s>", s.Value, s.Timestamp)
 }
 
+// Tsdb implements a TimeseriesDatabase
 type Tsdb struct {
-	sync.RWMutex
-	s          map[string]uint32
-	ss         map[uint32]string
-	metrics    map[string][][]byte
-	tagsets    map[uint32][]byte
-	stagsets   map[string]uint32
-	arena      *slab.Arena
 	allocsChan chan int
-	tagCounter *telemetry.AtomicUint32
+
+	sync.RWMutex
+	ss      map[uint32][]byte
+	metrics map[string][][]byte
+	arena   *slab.Arena
 }
 
 const (
-	maxStringId uint32 = 1<<32 - 1
-	sampleWidth        = 16
+	maxStringID      uint32 = 1<<32 - 1
+	allocsChanBuffer        = 64
+	sampleWidth             = 16
+	slabSize                = 1024 * 1024 // 1mb slab size
+	slabGrowthFactor        = 2           // double slab alloc
 )
 
 // NewTsdb returns a new timeseries database.
 func NewTsdb() *Tsdb {
 	t := &Tsdb{
-		s:          make(map[string]uint32),
-		ss:         make(map[uint32]string),
+		ss:         make(map[uint32][]byte),
 		metrics:    make(map[string][][]byte),
-		tagsets:    make(map[uint32][]byte),
-		stagsets:   make(map[string]uint32),
 		allocsChan: make(chan int, 64),
-		tagCounter: new(telemetry.AtomicUint32),
 	}
 
-	// 1mb slab size, with doubling
-	t.arena = slab.NewArena(sampleWidth, 1024*1024, 2, t.malloc)
+	t.arena = slab.NewArena(sampleWidth, slabSize, slabGrowthFactor, t.malloc)
 
 	return t
 }
@@ -124,7 +125,7 @@ func (t *Tsdb) Metrics() []string {
 	t.RLock()
 	defer t.RUnlock()
 	out := make([]string, 0, len(t.metrics))
-	for m, _ := range t.metrics {
+	for m := range t.metrics {
 		out = append(out, m)
 	}
 	sort.Strings(out)
@@ -154,7 +155,7 @@ func (t *Tsdb) Record(metric string, tags map[string]string, timestamp time.Time
 	t.Lock()
 	defer t.Unlock()
 
-	t.internalRecord(metric, t.getIdForTags(tags), timestamp, value)
+	t.internalRecord(metric, t.getIDForTags(tags), timestamp, value)
 
 	for i := 0; i < 2; i++ {
 		select {
@@ -165,10 +166,10 @@ func (t *Tsdb) Record(metric string, tags map[string]string, timestamp time.Time
 	}
 }
 
-func (t *Tsdb) internalRecord(metric string, tagsId uint32, timestamp time.Time, value float64) {
+func (t *Tsdb) internalRecord(metric string, tagsID uint32, timestamp time.Time, value float64) {
 	b := t.arena.Alloc(sampleWidth)
 	binary.BigEndian.PutUint32(b, uint32(timestamp.Unix()))
-	binary.BigEndian.PutUint32(b[4:], tagsId)
+	binary.BigEndian.PutUint32(b[4:], tagsID)
 	binary.BigEndian.PutUint64(b[8:], math.Float64bits(value))
 	t.metrics[metric] = append(t.metrics[metric], b)
 }
@@ -177,8 +178,11 @@ func (t *Tsdb) internalRecord(metric string, tagsId uint32, timestamp time.Time,
 type Op int
 
 const (
+	// Sum computes the arithmetic sum of all samples
 	Sum Op = iota + 1
+	// Count of all samples
 	Count
+	// Distribution of values for all samples
 	Distribution
 )
 
@@ -225,7 +229,7 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 	groupByIds := make(map[uint32]struct{})
 	if hasGroupBy {
 		for _, v := range groupBy {
-			groupByIds[t.getIdForString(v)] = struct{}{}
+			groupByIds[t.getID([]byte(v))] = struct{}{}
 		}
 	} else {
 		varname = metric + "{" + strings.Join(tags, ",") + "}"
@@ -243,11 +247,11 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 				tt := binary.BigEndian.Uint32(tagBytes[off : off+4])
 				if _, ok := groupByIds[tt]; ok {
 					// only add this tag if it doesn't exist in the filterTags map
-					if filterTags[t.ss[tt]] == "" {
+					if filterTags[string(t.ss[tt])] == "" {
 						tv := binary.BigEndian.Uint32(tagBytes[off+4 : off+8])
-						gvtags = append(gvtags, t.ss[tt]+"="+t.ss[tv])
+						gvtags = append(gvtags, fmt.Sprintf("%s=%s", t.ss[tt], t.ss[tv]))
 					}
-					matched += 1
+					matched++
 				}
 			}
 			// did we match all of the groupBy tags?
@@ -274,7 +278,7 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 		case Sum:
 			out[varname].Samples[0].Value += value
 		case Count:
-			out[varname].Samples[0].Value += 1
+			out[varname].Samples[0].Value++
 		case Distribution:
 			out[varname].Samples = append(out[varname].Samples, &Sample{now, value})
 		}
@@ -291,16 +295,9 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 	rows := make([]*Row, 0, len(out))
 	for _, v := range out {
 		if op == Distribution {
-			var bucketCutoffs []int64
-			max := v.Max.Value
-
-			for _, p := range percentiles {
-				bucketCutoffs = append(bucketCutoffs, int64((max*p)*1e9))
-			}
-
-			h := telemetry.NewGenericHistogram("", bucketCutoffs, bucketLabels, "Count", "Total")
+			h := NewUnbiasedHistogram()
 			for _, sample := range v.Samples {
-				h.Add(int64(sample.Value * 1e9))
+				h.Update(sample.Value)
 			}
 			v.Samples = nil
 			v.histogram = h
@@ -330,7 +327,7 @@ func (t *Tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
 				}
 				tag := t.ss[binary.BigEndian.Uint32(tagBytes[off:off+4])]
 				val := t.ss[binary.BigEndian.Uint32(tagBytes[off+4:off+8])]
-				v += tag + "=" + val
+				v += fmt.Sprintf("%s=%s", tag, val)
 				if off+8 == len(tagBytes) {
 					v += "}"
 				} else {
@@ -348,48 +345,31 @@ func (t *Tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
 }
 
 // Yields the value associated with the string, or the sentinel value.
-func (t *Tsdb) getIdForString(s string) uint32 {
-	if v, ok := t.s[s]; ok {
-		return v
-	}
-	return maxStringId
+func (t *Tsdb) getID(s []byte) uint32 {
+	return crc32.ChecksumIEEE(s)
 }
 
 // Interns the string and then returns or generates and returns a unique
 // value associated with it.
-func (t *Tsdb) getOrAddIdForString(s string) uint32 {
-	if v, ok := t.s[s]; ok {
-		return v
+func (t *Tsdb) getOrAddID(s []byte) uint32 {
+	hash := t.getID(s)
+	if _, ok := t.ss[hash]; ok {
+		return hash
 	}
-	v := t.tagCounter.Add(1)
-	if v == maxStringId {
-		panic("maxStringId reached")
-	}
+	t.ss[hash] = s
 	t.internalRecord(TsdbOverheadMetric, 0, time.Now(), float64(len(s)+4))
-	t.s[s] = v
-	t.ss[v] = s
-	return v
+	return hash
 }
 
 // Canonicalizes the tags into a discrete value.
-func (t *Tsdb) getIdForTags(tags map[string]string) uint32 {
+func (t *Tsdb) getIDForTags(tags map[string]string) uint32 {
 	keys := sortAndFilterTags(tags)
 	tbuf := make([]byte, 8*len(keys))
 	for i, k := range keys {
-		binary.BigEndian.PutUint32(tbuf[i*8:], t.getOrAddIdForString(k))
-		binary.BigEndian.PutUint32(tbuf[4+(i*8):], t.getOrAddIdForString(tags[k]))
+		binary.BigEndian.PutUint32(tbuf[i*8:], t.getOrAddID([]byte(k)))
+		binary.BigEndian.PutUint32(tbuf[4+(i*8):], t.getOrAddID([]byte(tags[k])))
 	}
-	if v, ok := t.stagsets[string(tbuf)]; ok {
-		return v
-	}
-	v := t.tagCounter.Add(1)
-	if v == maxStringId {
-		panic("maxStringId reached")
-	}
-	t.internalRecord(TsdbOverheadMetric, 0, time.Now(), float64(len(tbuf)+4))
-	t.tagsets[v] = tbuf
-	t.stagsets[string(tbuf)] = v
-	return v
+	return t.getOrAddID(tbuf)
 }
 
 // Sort and remove tags with empty ("") values.
@@ -420,13 +400,13 @@ func (t *Tsdb) op(metric string, filterTags map[string]string, proc rowProcessor
 	filter := make([]byte, 8*len(keys))
 
 	for _, k := range keys {
-		binary.BigEndian.PutUint32(filter, t.getIdForString(k))
-		binary.BigEndian.PutUint32(filter[4:], t.getIdForString(filterTags[k]))
+		binary.BigEndian.PutUint32(filter, t.getID([]byte(k)))
+		binary.BigEndian.PutUint32(filter[4:], t.getID([]byte(filterTags[k])))
 	}
 
 	for _, b := range entry {
 		timestamp := time.Unix(int64(binary.BigEndian.Uint32(b[0:4])), 0)
-		tagBytes := t.tagsets[binary.BigEndian.Uint32(b[4:8])]
+		tagBytes := t.ss[binary.BigEndian.Uint32(b[4:8])]
 
 		include := true
 
