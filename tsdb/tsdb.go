@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
+	"hash/adler32"
 	"math"
 	"sort"
 	"strconv"
@@ -69,6 +69,13 @@ func (r *Row) String() string {
 	return fmt.Sprintf("%s: %v", r.Var, r.Samples)
 }
 
+// RowSlice is a sortable wrapper, mostly useful for testing
+type RowSlice []*Row
+
+func (a RowSlice) Len() int           { return len(a) }
+func (a RowSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a RowSlice) Less(i, j int) bool { return a[i].Var < a[j].Var }
+
 // Sample defined a single discrete measurement. The timestamp is
 // truncated to epoch seconds.
 type Sample struct {
@@ -91,11 +98,13 @@ type Tsdb struct {
 }
 
 const (
-	maxStringID      uint32 = 1<<32 - 1
-	allocsChanBuffer        = 64
-	sampleWidth             = 16
-	slabSize                = 1024 * 1024 // 1mb slab size
-	slabGrowthFactor        = 2           // double slab alloc
+	allocsChanBuffer = 64
+	slabSize         = 1024 * 1024 // 1mb slab size
+	slabGrowthFactor = 2           // double slab alloc
+	timestampWidth   = 8
+	tagsWidth        = 4
+	valueWidth       = 8
+	sampleWidth      = timestampWidth + tagsWidth + valueWidth
 )
 
 // NewTsdb returns a new timeseries database.
@@ -103,7 +112,7 @@ func NewTsdb() *Tsdb {
 	t := &Tsdb{
 		ss:         make(map[uint32][]byte),
 		metrics:    make(map[string][][]byte),
-		allocsChan: make(chan int, 64),
+		allocsChan: make(chan int, allocsChanBuffer),
 	}
 
 	t.arena = slab.NewArena(sampleWidth, slabSize, slabGrowthFactor, t.malloc)
@@ -157,34 +166,158 @@ func (t *Tsdb) Record(metric string, tags map[string]string, timestamp time.Time
 
 	t.internalRecord(metric, t.getIDForTags(tags), timestamp, value)
 
-	for i := 0; i < 2; i++ {
-		select {
-		case size := <-t.allocsChan:
-			t.internalRecord(TsdbArenaMallocSizeMetric, 0, time.Now(), float64(size))
-		default:
-		}
+	select {
+	case size := <-t.allocsChan:
+		t.internalRecord(TsdbArenaMallocSizeMetric, 0, time.Now(), float64(size))
+	default:
 	}
 }
 
 func (t *Tsdb) internalRecord(metric string, tagsID uint32, timestamp time.Time, value float64) {
 	b := t.arena.Alloc(sampleWidth)
-	binary.BigEndian.PutUint32(b, uint32(timestamp.Unix()))
-	binary.BigEndian.PutUint32(b[4:], tagsID)
-	binary.BigEndian.PutUint64(b[8:], math.Float64bits(value))
+	binary.BigEndian.PutUint64(b, uint64(timestamp.UnixNano()))
+	binary.BigEndian.PutUint32(b[timestampWidth:], tagsID)
+	binary.BigEndian.PutUint64(b[timestampWidth+tagsWidth:], math.Float64bits(value))
 	t.metrics[metric] = append(t.metrics[metric], b)
 }
 
 // Op defines a kind of operation to be performed on the matching rows.
-type Op int
+type Op interface {
+	Perform(row *Row, operand float64, timestamp time.Time)
+}
+type op struct {
+	opFunc func(row *Row, operand float64, timestamp time.Time)
+}
+
+func (o *op) Perform(row *Row, operand float64, timestamp time.Time) {
+	o.opFunc(row, operand, timestamp)
+}
+
+var (
+	// Fetch returns all samples per metric
+	Fetch Op = &op{func(row *Row, operand float64, timestamp time.Time) {
+		row.Samples = append(row.Samples, &Sample{timestamp, operand})
+	}}
+	// Sum computes the arithmetic sum of all samples
+	Sum Op = &op{func(row *Row, operand float64, timestamp time.Time) {
+		row.Samples[0].Value += operand
+	}}
+	// Count of all samples
+	Count Op = &op{func(row *Row, operand float64, timestamp time.Time) {
+		row.Samples[0].Value++
+	}}
+	// Distribution of values for all samples
+	Distribution Op = &op{func(row *Row, operand float64, timestamp time.Time) {
+		row.histogram.Update(operand)
+	}}
+)
+
+// WindowInterpolation defines what method the Window operation will use
+// to fill gaps in the timeseries.
+type WindowInterpolation int
 
 const (
-	// Sum computes the arithmetic sum of all samples
-	Sum Op = iota + 1
-	// Count of all samples
-	Count
-	// Distribution of values for all samples
-	Distribution
+	// ZeroInterpolation fills gaps with a zero.
+	ZeroInterpolation WindowInterpolation = iota
+	// LinearInterpolation fills gaps by curve fitting between existing values.
+	LinearInterpolation
+	// LastValueInterpolation uses the last value seen to fill gaps.
+	LastValueInterpolation
 )
+
+// WindowAggregation defines what method the Window operation will use
+// to combine values in a bin.
+type WindowAggregation int
+
+const (
+	// SumAggregation sums all values in the bin.
+	SumAggregation WindowAggregation = iota
+	// MinAggregation uses the minumum value for the bin.
+	MinAggregation
+	// MaxAggregation uses the maximum value for the bin.
+	MaxAggregation
+	// MeanAggregation uses the mean of all values in the bin.
+	MeanAggregation
+)
+
+type window struct {
+	freq         time.Duration
+	interpolator WindowInterpolation
+	aggregator   WindowAggregation
+	last         *Sample
+	coalesce     int
+}
+
+// Window creates a window operation to operate over the data. It can be used
+// to resample the samples in the series, and to fill in missing values.
+func Window(freq time.Duration, interp WindowInterpolation, agg WindowAggregation) Op {
+	return &window{
+		freq:         freq,
+		interpolator: interp,
+		aggregator:   agg,
+	}
+}
+
+func (w *window) Perform(row *Row, operand float64, timestamp time.Time) {
+	rounded := timestamp.Round(w.freq)
+
+	// coalesce values that lie in the same bin
+	var lastSample *Sample
+	l := len(row.Samples)
+	if l > 0 {
+		lastSample = row.Samples[l-1]
+	}
+	// if this sample is in the same bin as the last sample, combine it
+	if lastSample != nil && rounded == lastSample.Timestamp {
+		w.coalesce++
+		switch w.aggregator {
+		case SumAggregation, MeanAggregation:
+			lastSample.Value += operand
+		case MinAggregation:
+			if operand < lastSample.Value {
+				lastSample.Value = operand
+			}
+		case MaxAggregation:
+			if operand > lastSample.Value {
+				lastSample.Value = operand
+			}
+		}
+		// skip this sample and move on
+		return
+	} else if w.coalesce > 0 {
+		// coalesce using the mean
+		if w.aggregator == MeanAggregation {
+			lastSample.Value /= float64(w.coalesce + 1)
+		}
+		w.coalesce = 0
+	}
+
+	// interpolation
+	if w.last != nil && rounded.Sub(w.last.Timestamp) > time.Duration(w.freq) {
+		gap := int(rounded.Sub(w.last.Timestamp) / time.Duration(w.freq))
+		var interpValue float64
+
+		for k := 1; k < gap; k++ {
+			switch w.interpolator {
+			case LinearInterpolation:
+				slope := (w.last.Value - operand) / float64(-1.0*gap)
+				interpValue = w.last.Value + (float64(k) * slope)
+			case LastValueInterpolation:
+				interpValue = w.last.Value
+			case ZeroInterpolation:
+				interpValue = 0
+			}
+
+			row.Samples = append(
+				row.Samples,
+				&Sample{w.last.Timestamp.Add(time.Duration(k) * w.freq), interpValue})
+		}
+	}
+
+	samp := &Sample{rounded, operand}
+	row.Samples = append(row.Samples, samp)
+	w.last = samp
+}
 
 // Do applies an operation Op to each matching measurement in the database and
 // returns, if any rows match, a slice of Rows. The Var name of each row will
@@ -210,78 +343,33 @@ const (
 //   rows := t.Do(Count, "foo.bar", nil, []string{"ip"})
 //   // returns:
 //   // foo.bar{ip=10.0.1.2} = 4.0
-func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []string) []*Row {
-	var (
-		varname string
-		tags    []string
-	)
+func (t *Tsdb) Do(oper Op, metric string, filterTags map[string]string, groupBy []string) []*Row {
+	// set all result samples to the same time
+	now := time.Now()
 	out := make(map[string]*Row)
-
-	for k, v := range filterTags {
-		tags = append(tags, k+"="+v)
-	}
 
 	t.RLock()
 	defer t.RUnlock()
 
-	// build up the set of groupBy tags
-	hasGroupBy := len(groupBy) > 0
-	groupByIds := make(map[uint32]struct{})
-	if hasGroupBy {
-		for _, v := range groupBy {
-			groupByIds[t.getID([]byte(v))] = struct{}{}
-		}
-	} else {
-		varname = metric + "{" + strings.Join(tags, ",") + "}"
-	}
-
-	// set all result samples to the same time
-	now := time.Now()
-
-	t.op(metric, filterTags, func(tagBytes []byte, value float64, timestamp time.Time) {
-		if hasGroupBy {
-			// build up a string containing the tags that match the groupBy tags
-			gvtags := tags
-			matched := 0
-			for off := 0; off < len(tagBytes); off += 8 {
-				tt := binary.BigEndian.Uint32(tagBytes[off : off+4])
-				if _, ok := groupByIds[tt]; ok {
-					// only add this tag if it doesn't exist in the filterTags map
-					if filterTags[string(t.ss[tt])] == "" {
-						tv := binary.BigEndian.Uint32(tagBytes[off+4 : off+8])
-						gvtags = append(gvtags, fmt.Sprintf("%s=%s", t.ss[tt], t.ss[tv]))
-					}
-					matched++
-				}
-			}
-			// did we match all of the groupBy tags?
-			if matched != len(groupByIds) {
-				return
-			}
-			sort.Strings(gvtags)
-			varname = metric + "{" + strings.Join(gvtags, ",") + "}"
-		}
-
+	t.op(metric, filterTags, groupBy, func(varname string, value float64, timestamp time.Time) {
 		// initialize a row, setting the timestamp to be the same across all result rows
 		if out[varname] == nil {
 			out[varname] = &Row{
 				Var: varname,
-				Samples: []*Sample{
-					&Sample{Timestamp: now},
-				},
 				Max: &Sample{Timestamp: now, Value: math.Inf(-1)},
 				Min: &Sample{Timestamp: now, Value: math.Inf(1)},
 			}
+			switch oper {
+			case Sum, Count:
+				out[varname].Samples = []*Sample{
+					&Sample{Timestamp: now},
+				}
+			case Distribution:
+				out[varname].histogram = NewUnbiasedHistogram()
+			}
 		}
 
-		switch op {
-		case Sum:
-			out[varname].Samples[0].Value += value
-		case Count:
-			out[varname].Samples[0].Value++
-		case Distribution:
-			out[varname].Samples = append(out[varname].Samples, &Sample{now, value})
-		}
+		oper.Perform(out[varname], value, timestamp)
 
 		// keep a few extra stats
 		if value < out[varname].Min.Value {
@@ -294,59 +382,15 @@ func (t *Tsdb) Do(op Op, metric string, filterTags map[string]string, groupBy []
 
 	rows := make([]*Row, 0, len(out))
 	for _, v := range out {
-		if op == Distribution {
-			h := NewUnbiasedHistogram()
-			for _, sample := range v.Samples {
-				h.Update(sample.Value)
-			}
-			v.Samples = nil
-			v.histogram = h
-		}
 		rows = append(rows, v)
 	}
 
 	return rows
 }
 
-// Fetch returns all discrete varnames and all associated samples. If filterTags
-// is non-nil, rows will be filtered by all filter tag values (implicit AND).
-func (t *Tsdb) Fetch(metric string, filterTags map[string]string) []*Row {
-	var rows []*Row
-	out := make(map[string]*Row)
-
-	t.RLock()
-	defer t.RUnlock()
-
-	t.op(metric, filterTags, func(tagBytes []byte, value float64, timestamp time.Time) {
-		r, ok := out[string(tagBytes)]
-		if !ok {
-			v := metric
-			for off := 0; off < len(tagBytes); off += 8 {
-				if off == 0 {
-					v += "{"
-				}
-				tag := t.ss[binary.BigEndian.Uint32(tagBytes[off:off+4])]
-				val := t.ss[binary.BigEndian.Uint32(tagBytes[off+4:off+8])]
-				v += fmt.Sprintf("%s=%s", tag, val)
-				if off+8 == len(tagBytes) {
-					v += "}"
-				} else {
-					v += ","
-				}
-			}
-			r = &Row{Var: v}
-			out[string(tagBytes)] = r
-			rows = append(rows, r)
-		}
-		r.Samples = append(r.Samples, &Sample{timestamp, value})
-	})
-
-	return rows
-}
-
 // Yields the value associated with the string, or the sentinel value.
 func (t *Tsdb) getID(s []byte) uint32 {
-	return crc32.ChecksumIEEE(s)
+	return adler32.Checksum(s)
 }
 
 // Interns the string and then returns or generates and returns a unique
@@ -385,11 +429,11 @@ func sortAndFilterTags(tags map[string]string) []string {
 	return keys
 }
 
-type rowProcessor func(tagBytes []byte, value float64, timestamp time.Time)
+type rowProcessor func(varname string, value float64, timestamp time.Time)
 
 // Iterate over metric values, calling rowProcessor. Skips rows that match tags in
 // filterTags.
-func (t *Tsdb) op(metric string, filterTags map[string]string, proc rowProcessor) {
+func (t *Tsdb) op(metric string, filterTags map[string]string, groupBy []string, proc rowProcessor) {
 	entry, ok := t.metrics[metric]
 	if !ok {
 		return
@@ -404,9 +448,24 @@ func (t *Tsdb) op(metric string, filterTags map[string]string, proc rowProcessor
 		binary.BigEndian.PutUint32(filter[4:], t.getID([]byte(filterTags[k])))
 	}
 
+	var varname string
+	var tags []string
+	for k, v := range filterTags {
+		tags = append(tags, k+"="+v)
+	}
+
+	// build up the set of groupBy tags
+	hasGroupBy := len(groupBy) > 0
+	groupByIds := make(map[uint32]struct{})
+	if hasGroupBy {
+		for _, v := range groupBy {
+			groupByIds[t.getID([]byte(v))] = struct{}{}
+		}
+	}
+
 	for _, b := range entry {
-		timestamp := time.Unix(int64(binary.BigEndian.Uint32(b[0:4])), 0)
-		tagBytes := t.ss[binary.BigEndian.Uint32(b[4:8])]
+		timestamp := time.Unix(0, int64(binary.BigEndian.Uint64(b[0:timestampWidth])))
+		tagBytes := t.ss[binary.BigEndian.Uint32(b[timestampWidth:timestampWidth+tagsWidth])]
 
 		include := true
 
@@ -417,12 +476,46 @@ func (t *Tsdb) op(metric string, filterTags map[string]string, proc rowProcessor
 				include = false
 				break
 			}
-			//fmt.Printf("found % x at %d\n", filter[off:off+8], idx)
 		}
 
 		if include {
-			value := math.Float64frombits((binary.BigEndian.Uint64(b[8:16])))
-			proc(tagBytes, value, timestamp)
+			value := math.Float64frombits((binary.BigEndian.Uint64(b[timestampWidth+tagsWidth:])))
+
+			if hasGroupBy {
+				// build up a string containing the tags that match the groupBy tags
+				gvtags := tags
+				matched := 0
+				for off := 0; off < len(tagBytes); off += 8 {
+					tt := binary.BigEndian.Uint32(tagBytes[off : off+4])
+					if _, ok := groupByIds[tt]; ok {
+						// only add this tag if it doesn't exist in the filterTags map
+						if filterTags[string(t.ss[tt])] == "" {
+							tv := binary.BigEndian.Uint32(tagBytes[off+4 : off+8])
+							gvtags = append(gvtags, fmt.Sprintf("%s=%s", t.ss[tt], t.ss[tv]))
+						}
+						matched++
+					}
+				}
+				// did we match all of the groupBy tags?
+				if matched != len(groupByIds) {
+					continue
+				}
+				sort.Strings(gvtags)
+				varname = metric + "{" + strings.Join(gvtags, ",") + "}"
+			} else {
+				gvtags := tags
+				for off := 0; off < len(tagBytes); off += 8 {
+					tag := t.ss[binary.BigEndian.Uint32(tagBytes[off:off+4])]
+					val := t.ss[binary.BigEndian.Uint32(tagBytes[off+4:off+8])]
+					if filterTags[string(tag)] == "" {
+						gvtags = append(gvtags, fmt.Sprintf("%s=%s", tag, val))
+					}
+				}
+				sort.Strings(gvtags)
+				varname = metric + "{" + strings.Join(gvtags, ",") + "}"
+			}
+
+			proc(varname, value, timestamp)
 		}
 	}
 }
