@@ -34,7 +34,6 @@ var (
 type TimeseriesDatabase interface {
 	Metrics() []string
 	Record(metric string, tags map[string]string, timestamp time.Time, value float64)
-	Fetch(metric string, tags map[string]string) []*Row
 	Do(op Op, metric string, filterTags map[string]string, groupBy []string) []*Row
 }
 
