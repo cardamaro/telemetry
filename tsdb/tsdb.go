@@ -267,28 +267,30 @@ func (w *window) Perform(row *Row, operand float64, timestamp time.Time) {
 		lastSample = row.Samples[l-1]
 	}
 	// if this sample is in the same bin as the last sample, combine it
-	if lastSample != nil && rounded == lastSample.Timestamp {
-		w.coalesce++
-		switch w.aggregator {
-		case SumAggregation, MeanAggregation:
-			lastSample.Value += operand
-		case MinAggregation:
-			if operand < lastSample.Value {
-				lastSample.Value = operand
+	if lastSample != nil {
+		if rounded == lastSample.Timestamp {
+			w.coalesce++
+			switch w.aggregator {
+			case SumAggregation, MeanAggregation:
+				lastSample.Value += operand
+			case MinAggregation:
+				if operand < lastSample.Value {
+					lastSample.Value = operand
+				}
+			case MaxAggregation:
+				if operand > lastSample.Value {
+					lastSample.Value = operand
+				}
 			}
-		case MaxAggregation:
-			if operand > lastSample.Value {
-				lastSample.Value = operand
+			// skip this sample and move on
+			return
+		} else if w.coalesce > 0 {
+			// coalesce using the mean
+			if w.aggregator == MeanAggregation {
+				lastSample.Value /= float64(w.coalesce + 1)
 			}
+			w.coalesce = 0
 		}
-		// skip this sample and move on
-		return
-	} else if w.coalesce > 0 {
-		// coalesce using the mean
-		if w.aggregator == MeanAggregation {
-			lastSample.Value /= float64(w.coalesce + 1)
-		}
-		w.coalesce = 0
 	}
 
 	// interpolation
