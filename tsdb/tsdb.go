@@ -184,6 +184,7 @@ func (t *Tsdb) internalRecord(metric string, tagsID uint32, timestamp time.Time,
 type Op interface {
 	Perform(row *Row, operand float64, timestamp time.Time)
 }
+
 type op struct {
 	opFunc func(row *Row, operand float64, timestamp time.Time)
 }
@@ -409,10 +410,10 @@ func (t *Tsdb) getOrAddID(s []byte) uint32 {
 // Canonicalizes the tags into a discrete value.
 func (t *Tsdb) getIDForTags(tags map[string]string) uint32 {
 	keys := sortAndFilterTags(tags)
-	tbuf := make([]byte, 8*len(keys))
+	tbuf := make([]byte, tagsWidth*2*len(keys))
 	for i, k := range keys {
-		binary.BigEndian.PutUint32(tbuf[i*8:], t.getOrAddID([]byte(k)))
-		binary.BigEndian.PutUint32(tbuf[4+(i*8):], t.getOrAddID([]byte(tags[k])))
+		binary.BigEndian.PutUint32(tbuf[i*tagsWidth*2:], t.getOrAddID([]byte(k)))
+		binary.BigEndian.PutUint32(tbuf[tagsWidth+(i*tagsWidth*2):], t.getOrAddID([]byte(tags[k])))
 	}
 	return t.getOrAddID(tbuf)
 }
@@ -440,17 +441,20 @@ func (t *Tsdb) op(metric string, filterTags map[string]string, groupBy []string,
 		return
 	}
 
+	var (
+		varname string
+		tags    []string
+	)
+	doubleWideTagWidth := tagsWidth * 2
 	keys := sortAndFilterTags(filterTags)
 	lenKeys := len(keys)
-	filter := make([]byte, 8*len(keys))
+	filter := make([]byte, doubleWideTagWidth*len(keys))
 
 	for _, k := range keys {
 		binary.BigEndian.PutUint32(filter, t.getID([]byte(k)))
-		binary.BigEndian.PutUint32(filter[4:], t.getID([]byte(filterTags[k])))
+		binary.BigEndian.PutUint32(filter[tagsWidth:], t.getID([]byte(filterTags[k])))
 	}
 
-	var varname string
-	var tags []string
 	for k, v := range filterTags {
 		tags = append(tags, k+"="+v)
 	}
@@ -458,65 +462,63 @@ func (t *Tsdb) op(metric string, filterTags map[string]string, groupBy []string,
 	// build up the set of groupBy tags
 	hasGroupBy := len(groupBy) > 0
 	groupByIds := make(map[uint32]struct{})
-	if hasGroupBy {
+	if hasGroupBy && groupBy[0] != "" {
 		for _, v := range groupBy {
 			groupByIds[t.getID([]byte(v))] = struct{}{}
 		}
 	}
 
+L1:
 	for _, b := range entry {
 		timestamp := time.Unix(0, int64(binary.BigEndian.Uint64(b[0:timestampWidth])))
 		tagBytes := t.ss[binary.BigEndian.Uint32(b[timestampWidth:timestampWidth+tagsWidth])]
 
-		include := true
-
-		for off := 0; off < 8*lenKeys; off += 8 {
-			filterBytes := filter[off : off+8]
+		for off := 0; off < doubleWideTagWidth*lenKeys; off += doubleWideTagWidth {
+			filterBytes := filter[off : off+doubleWideTagWidth]
 			idx := bytes.Index(tagBytes, filterBytes)
-			if idx == -1 || idx%8 != 0 {
-				include = false
-				break
+			if idx == -1 || idx%doubleWideTagWidth != 0 {
+				continue L1
 			}
 		}
 
-		if include {
-			value := math.Float64frombits((binary.BigEndian.Uint64(b[timestampWidth+tagsWidth:])))
+		value := math.Float64frombits((binary.BigEndian.Uint64(b[timestampWidth+tagsWidth:])))
 
-			if hasGroupBy {
-				// build up a string containing the tags that match the groupBy tags
-				gvtags := tags
-				matched := 0
-				for off := 0; off < len(tagBytes); off += 8 {
-					tt := binary.BigEndian.Uint32(tagBytes[off : off+4])
-					if _, ok := groupByIds[tt]; ok {
-						// only add this tag if it doesn't exist in the filterTags map
-						if filterTags[string(t.ss[tt])] == "" {
-							tv := binary.BigEndian.Uint32(tagBytes[off+4 : off+8])
-							gvtags = append(gvtags, fmt.Sprintf("%s=%s", t.ss[tt], t.ss[tv]))
-						}
-						matched++
+		if hasGroupBy && groupBy[0] == "" {
+			varname = metric + "{}"
+		} else if hasGroupBy {
+			// build up a string containing the tags that match the groupBy tags
+			gvtags := tags
+			matched := 0
+			for off := 0; off < len(tagBytes); off += doubleWideTagWidth {
+				tt := binary.BigEndian.Uint32(tagBytes[off : off+tagsWidth])
+				if _, ok := groupByIds[tt]; ok {
+					// only add this tag if it doesn't exist in the filterTags map
+					if filterTags[string(t.ss[tt])] == "" {
+						tv := binary.BigEndian.Uint32(tagBytes[off+tagsWidth : off+doubleWideTagWidth])
+						gvtags = append(gvtags, fmt.Sprintf("%s=%s", t.ss[tt], t.ss[tv]))
 					}
+					matched++
 				}
-				// did we match all of the groupBy tags?
-				if matched != len(groupByIds) {
-					continue
-				}
-				sort.Strings(gvtags)
-				varname = metric + "{" + strings.Join(gvtags, ",") + "}"
-			} else {
-				gvtags := tags
-				for off := 0; off < len(tagBytes); off += 8 {
-					tag := t.ss[binary.BigEndian.Uint32(tagBytes[off:off+4])]
-					val := t.ss[binary.BigEndian.Uint32(tagBytes[off+4:off+8])]
-					if filterTags[string(tag)] == "" {
-						gvtags = append(gvtags, fmt.Sprintf("%s=%s", tag, val))
-					}
-				}
-				sort.Strings(gvtags)
-				varname = metric + "{" + strings.Join(gvtags, ",") + "}"
 			}
-
-			proc(varname, value, timestamp)
+			// did we match all of the groupBy tags?
+			if matched != len(groupByIds) {
+				continue
+			}
+			sort.Strings(gvtags)
+			varname = metric + "{" + strings.Join(gvtags, ",") + "}"
+		} else {
+			gvtags := tags
+			for off := 0; off < len(tagBytes); off += doubleWideTagWidth {
+				tag := t.ss[binary.BigEndian.Uint32(tagBytes[off:off+tagsWidth])]
+				val := t.ss[binary.BigEndian.Uint32(tagBytes[off+tagsWidth:off+doubleWideTagWidth])]
+				if filterTags[string(tag)] == "" {
+					gvtags = append(gvtags, fmt.Sprintf("%s=%s", tag, val))
+				}
+			}
+			sort.Strings(gvtags)
+			varname = metric + "{" + strings.Join(gvtags, ",") + "}"
 		}
+
+		proc(varname, value, timestamp)
 	}
 }
